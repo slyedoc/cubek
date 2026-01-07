@@ -48,7 +48,7 @@ impl BatchConfig for NaiveMatmulConfig {
     fn cube_count_plan(
         &self,
         _problem: &MatmulProblem,
-        _max_cube_count: &CubeCount,
+        _max_cube_count: &(u32, u32, u32),
     ) -> CubeCountPlan {
         todo!()
     }

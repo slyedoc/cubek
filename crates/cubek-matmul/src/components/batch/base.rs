@@ -82,7 +82,7 @@ pub trait BatchConfig:
     /// Returns the [CubeDim]
     fn cube_dim(&self) -> CubeDim;
 
-    fn cube_count_plan(&self, problem: &MatmulProblem, max_cube_count: &CubeCount)
+    fn cube_count_plan(&self, problem: &MatmulProblem, max_cube_count: &(u32, u32, u32))
     -> CubeCountPlan;
 
     /// Returns the line sizes for Lhs, Rhs and output

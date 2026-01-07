@@ -48,7 +48,7 @@ impl HypercubeBlueprint {
     pub(crate) fn to_hypercube_config(
         &self,
         problem: &MatmulProblem,
-        max_cube_count: CubeCount,
+        max_cube_count: (u32, u32, u32),
     ) -> HypercubeConfig {
         let cube_count_plan = CubeCountPlan::from_selection(self, problem, max_cube_count);
         let cube_count_plan_config = CubeCountPlanConfig::from_cube_count_plan(cube_count_plan);
@@ -135,7 +135,7 @@ impl HypercubeConfig {
     pub fn cube_count_plan(
         &self,
         problem: &MatmulProblem,
-        max_cube_count: &CubeCount,
+        max_cube_count: &(u32, u32, u32),
     ) -> CubeCountPlan {
         CubeCountPlan::from_blueprint(self, problem, max_cube_count)
     }

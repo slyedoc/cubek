@@ -47,7 +47,7 @@ impl<G: GlobalConfig> BatchConfig for PartitionedBatchConfig<G> {
     fn cube_count_plan(
         &self,
         problem: &MatmulProblem,
-        max_cube_count: &CubeCount,
+        max_cube_count: &(u32, u32, u32),
     ) -> CubeCountPlan {
         self.hypercube_config
             .cube_count_plan(problem, max_cube_count)

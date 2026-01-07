@@ -51,11 +51,8 @@ pub fn cube_count_safe<R: Runtime>(client: &ComputeClient<R>, num_cubes: u32) ->
     )
 }
 
-fn cube_count_spread(max: &CubeCount, num_cubes: u32) -> [u32; 3] {
-    let max_cube_counts = match max {
-        CubeCount::Static(x, y, z) => [*x, *y, *z],
-        CubeCount::Dynamic(_) => panic!("No static max cube count"),
-    };
+fn cube_count_spread(max: &(u32, u32, u32), num_cubes: u32) -> [u32; 3] {
+    let max_cube_counts = [max.0, max.1, max.2];
     let mut num_cubes = [num_cubes, 1, 1];
     let base = 2;
 
