@@ -1,6 +1,6 @@
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::features::TypeUsage;
-use cubecl::ir::ElemType;
+use cubecl::ir::{ElemType, StorageType};
 use cubecl::prelude::*;
 use cubecl::std::tensor::into_contiguous;
 use cubecl::std::tensor::layout::linear::LinearView;
@@ -114,12 +114,32 @@ fn quantize_symmetric_native_kernel<F: Float, N: Size, FS: Numeric, Q: Numeric>(
     let in_pos = ABSOLUTE_POS * input.vector_size() * native_packing;
     let scale = write_scale(in_pos, scale, out_scale, scales_layout);
 
-    output[ABSOLUTE_POS] = quantize_symmetric_q::<F, N, FS, Q>(
-        input[ABSOLUTE_POS],
-        scale,
-        range_min.get::<F>(),
-        range_max.get::<F>(),
-    );
+    if native_packing == 1 {
+        output[ABSOLUTE_POS] = quantize_symmetric_q::<F, N, FS, Q>(
+            input[ABSOLUTE_POS],
+            scale,
+            range_min.get::<F>(),
+            range_max.get::<F>(),
+        );
+    } else {
+        // PackedNative (e.g. e2m1x2): read `packing` scalar inputs, quantize each
+        // independently, then pack by casting the pair to the packed type.
+        // N=1 is enforced by the launch (vector_size=1 for packed native).
+        let size!(NP) = native_packing;
+        let mut values = Vector::<F, NP>::empty();
+        #[unroll]
+        for p in 0..native_packing {
+            values[p] = input[ABSOLUTE_POS * native_packing + p][0];
+        }
+        // Quantize: clamp to range and round
+        let quantized = quantize_symmetric::<F, NP, FS>(values, scale, range_min.get::<F>(), range_max.get::<F>());
+        // Pack: cast the quantized float pair into one packed element (e.g. float2 → e2m1x2)
+        // This uses Q::cast_from on the pair, which triggers __nv_cvt_float2_to_fp4x2
+        let packed = Q::cast_from(quantized);
+        let mut out_vec = Vector::<Q, N>::empty();
+        out_vec[0] = packed;
+        output[ABSOLUTE_POS] = out_vec;
+    }
     sync_cube();
 }
 
@@ -192,8 +212,19 @@ pub fn launch_ref<R: Runtime>(
             value: QuantValue::Q8F | QuantValue::Q8S | QuantValue::E4M3 | QuantValue::E5M2,
             store: QuantStore::Native,
             ..
+        } => {
+            if !i8::supported_uses(client).contains(TypeUsage::Conversion) {
+                panic!(
+                    "{:?} is not supported for native quantization",
+                    scheme.value
+                );
+            }
+
+            quantize_native(
+                client, input, scheme, scale, out_scale, output, input_elem, param_elem,
+            )
         }
-        | QuantScheme {
+        QuantScheme {
             value: QuantValue::E2M1,
             store: QuantStore::PackedNative(_),
             ..
@@ -231,13 +262,23 @@ fn quantize_native<R: Runtime>(
     scale_dtype: ElemType,
 ) -> Result<(), LaunchError> {
     let num_elems: usize = input.shape.iter().product();
-    let vector_size = tensor_vector_size_parallel(
-        client.io_optimized_vector_sizes(input_dtype.size()),
-        &input.shape,
-        &input.strides,
-        input.shape.len() - 1,
-    );
-    let working_units = num_elems / vector_size as usize;
+    let quant_type = ElemType::from_quant_value(scheme.value);
+    let packing = scheme.num_quants();
+    let vector_size = if packing > 1 {
+        // PackedNative: use scalar reads, the cast handles packing
+        1
+    } else {
+        tensor_vector_size_parallel(
+            client
+                .io_optimized_vector_sizes(input_dtype.size())
+                .filter(|&v| v <= quant_type.max_vector_size() as usize),
+            &input.shape,
+            &input.strides,
+            input.shape.len() - 1,
+        )
+    };
+    // Each output element stores `packing` input values
+    let working_units = num_elems / (vector_size * packing);
     let cube_dim = CubeDim::new(client, working_units);
     let cube_count = calculate_cube_count_elemwise(client, working_units, cube_dim);
     let (range_min, range_max) = scheme.value.range();
@@ -246,17 +287,22 @@ fn quantize_native<R: Runtime>(
         QuantScheme {
             level: QuantLevel::Tensor | QuantLevel::Block(_),
             mode: QuantMode::Symmetric,
-            store: QuantStore::Native,
+            store: QuantStore::Native | QuantStore::PackedNative(_),
             ..
         } => {
             // We could use vector_size = block_size if it's in the supported vector sizes.. but let's keep it simple
             check_block_size_compat(scheme, vector_size as usize);
-            let quant_type = ElemType::from_quant_value(scheme.value);
+            // For PackedNative, use packed storage type so the kernel gets e2m1x2, not e2m1
+            let quant_storage: StorageType = if packing > 1 {
+                StorageType::Packed(ElemType::from_quant_value(scheme.value), packing.try_into().unwrap())
+            } else {
+                ElemType::from_quant_value(scheme.value).into()
+            };
 
             let address_type = input
                 .required_address_type(input_dtype.size())
                 .max(scale.required_address_type(scale_dtype.size()))
-                .max(output.required_address_type(quant_type.size()));
+                .max(output.required_address_type(quant_storage.size()));
 
             let scales_layout = scales_layout(client, &output, &scale, 1, scheme);
 
@@ -275,7 +321,7 @@ fn quantize_native<R: Runtime>(
                     linear_view(client, output.clone(), vector_size),
                     scales_view(client, output, out_scale, 1, scheme),
                     scales_layout,
-                    [input_dtype.into(), scale_dtype.into(), quant_type.into()],
+                    [input_dtype.into(), scale_dtype.into(), quant_storage],
                 )
             }
         }

@@ -162,6 +162,9 @@ pub enum Strategy {
     DoubleUnit(BlueprintStrategy<(), DoubleUnitAlgorithm>),
     SimpleVecMat(BlueprintStrategy<(), SimpleVecMatAlgorithm>),
     DoubleVecMat(BlueprintStrategy<(), DoubleVecMatAlgorithm>),
+    /// Hardware scaled MMA for FP4 (E2M1) on Blackwell.
+    /// TODO: Implement the actual kernel. Currently falls through to Naive.
+    ScaledMma,
     Naive,
     #[default]
     Auto,
@@ -306,6 +309,7 @@ impl Display for Strategy {
             Strategy::DoubleVecMat(blueprint_strategy) => {
                 f.write_fmt(format_args!("matmul_double_vecmat{}", blueprint_strategy))
             }
+            Strategy::ScaledMma => f.write_str("matmul_scaled_mma"),
             Strategy::Naive => f.write_str("matmul_naive"),
             Strategy::Auto => f.write_str("matmul_auto"),
         }
@@ -430,6 +434,11 @@ impl Strategy {
             }
             Strategy::DoubleVecMat(selection) => {
                 launch_tiling::launch_ref(client, lhs, rhs, out, selection, dtypes)
+            }
+            Strategy::ScaledMma => {
+                // TODO: Launch the hardware scaled MMA kernel.
+                // For now, fall through to naive.
+                launch_naive::launch_ref(client, lhs, rhs, out, dtypes)
             }
             Strategy::Naive => launch_naive::launch_ref(client, lhs, rhs, out, dtypes),
             Strategy::Auto => auto(client, lhs, rhs, out, dtypes),

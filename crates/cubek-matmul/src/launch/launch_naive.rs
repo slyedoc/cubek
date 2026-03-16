@@ -67,14 +67,18 @@ pub fn launch_ref<R: Runtime>(
     let rhs_shape = rhs.shape();
     let out_shape = &out.shape;
 
+    let lhs_max_vec = dtypes.lhs_global.elem_type().max_vector_size() as usize;
+    let rhs_max_vec = dtypes.rhs_global.elem_type().max_vector_size() as usize;
     let lhs_vector_size = tensor_vector_size_parallel(
-        client.io_optimized_vector_sizes(dtypes.lhs_global.size()),
+        client.io_optimized_vector_sizes(dtypes.lhs_global.size())
+            .filter(|&v| v <= lhs_max_vec),
         &lhs.data().shape,
         &lhs.data().strides,
         rank - 1,
     );
     let rhs_vector_size = tensor_vector_size_parallel(
-        client.io_optimized_vector_sizes(dtypes.rhs_global.size()),
+        client.io_optimized_vector_sizes(dtypes.rhs_global.size())
+            .filter(|&v| v <= rhs_max_vec),
         &rhs.data().shape,
         &rhs.data().strides,
         rank - 2,

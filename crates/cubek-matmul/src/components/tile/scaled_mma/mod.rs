@@ -1,4 +1,3 @@
-pub(crate) mod config;
 mod matmul;
 mod setup;
 

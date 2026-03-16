@@ -1,5 +1,5 @@
 use cubecl::zspace::{Shape, Strides};
-use cubecl::{AutotuneKey, Runtime, quant::scheme::QuantScheme};
+use cubecl::{AutotuneKey, Runtime, quant::scheme::{QuantScheme, QuantStore, QuantValue}};
 use cubecl::{client::ComputeClient, ir::StorageType};
 use cubek_std::MatmulProblemSize;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,8 @@ pub enum MatmulGlobalScale {
 pub struct MatmulAutotuneAnalysis {
     pub scale_global: MatmulGlobalScale,
     pub kind: MatmulKind,
+    /// Whether the inputs use hardware-acceleratable block-scaled quantization (E2M1).
+    pub has_scaled_mma_inputs: bool,
 }
 
 impl MatmulGlobalScale {
@@ -155,9 +157,17 @@ impl MatmulAutotuneKey {
             matrix_layout_lhs,
             matrix_layout_rhs,
         );
+        let has_scaled_mma = lhs_scheme
+            .map(|s| matches!(s.store, QuantStore::PackedNative(_)) && s.value == QuantValue::E2M1)
+            .unwrap_or(false)
+            || rhs_scheme
+                .map(|s| matches!(s.store, QuantStore::PackedNative(_)) && s.value == QuantValue::E2M1)
+                .unwrap_or(false);
+
         let analysis = MatmulAutotuneAnalysis {
             scale_global: MatmulGlobalScale::from_size(m, n, k),
             kind,
+            has_scaled_mma_inputs: has_scaled_mma,
         };
 
         Self::new(definition, analysis)

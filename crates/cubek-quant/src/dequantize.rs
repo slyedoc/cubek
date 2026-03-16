@@ -3,7 +3,7 @@
 use cubecl::prelude::*;
 use cubecl::{
     calculate_cube_count_elemwise,
-    ir::{ElemType, FloatKind, IntKind},
+    ir::{ElemType, FloatKind, IntKind, StorageType},
 };
 use cubecl::{features::TypeUsage, tensor_vector_size_parallel};
 
@@ -183,11 +183,17 @@ fn dequantize_symmetric_native_kernel<F: Float, NF: Size, FS: Numeric, Q: Numeri
     }
 
     let native_packing = Q::packing_factor();
-    // Absolute pos represents the logical block (scale) used to dequantize, not layout
     let scale = scale[ABSOLUTE_POS * input.vector_size() * native_packing];
 
-    output[ABSOLUTE_POS] =
-        dequantize_symmetric::<F, FS, NF>(Vector::cast_from(input[ABSOLUTE_POS]), scale);
+    if native_packing == 1 {
+        output[ABSOLUTE_POS] =
+            dequantize_symmetric::<F, FS, NF>(Vector::cast_from(input[ABSOLUTE_POS]), scale);
+    } else {
+        // PackedNative (e.g. e2m1x2): NQ=1 packed element, NF=packing floats.
+        // Vector::cast_from handles the packed→unpacked expansion via special_cast.
+        output[ABSOLUTE_POS] =
+            dequantize_symmetric::<F, FS, NF>(Vector::cast_from(input[ABSOLUTE_POS]), scale);
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -315,20 +321,49 @@ fn dequantize_packed<R: Runtime>(
 fn dequantize_native<R: Runtime>(
     client: &ComputeClient<R>,
     input: TensorBinding<R>,
-    scheme: QuantScheme,
+    mut scheme: QuantScheme,
     scale: TensorBinding<R>,
     output: TensorBinding<R>,
     input_dtype: StorageType,
     scale_dtype: StorageType,
 ) -> Result<(), LaunchError> {
+    // For PackedNative on non-innermost dim, re-pack to innermost first
+    let input = match scheme.store {
+        QuantStore::PackedNative(packed_dim) if packed_dim != 0 => {
+            // Use raw u8 dtype for the copy, matching what the matmul launch does
+            let raw_dtype = u8::as_type_native_unchecked().storage_type();
+            let mut repacked = cubecl::std::tensor::into_contiguous_packed(
+                client,
+                input,
+                packed_dim,
+                &output.shape, // unpacked shape
+                scheme.num_quants(),
+                raw_dtype,
+            );
+            scheme = scheme.with_store(QuantStore::PackedNative(0));
+            // Restore the actual packed dtype for the dequantize kernel
+            repacked.dtype = StorageType::Packed(ElemType::Float(FloatKind::E2M1), 2);
+            repacked.binding()
+        }
+        _ => input,
+    };
+
     let num_elems: usize = input.shape.iter().product();
-    let vector_size = tensor_vector_size_parallel(
-        client.io_optimized_vector_sizes(input_dtype.size()),
-        &input.shape,
-        &input.strides,
-        input.shape.len() - 1,
-    );
-    let working_units = num_elems / vector_size as usize;
+    let quant_type = ElemType::from_quant_value(scheme.value);
+    let packing = scheme.num_quants();
+    let vector_size = if packing > 1 {
+        1 // PackedNative: scalar reads, kernel handles unpacking
+    } else {
+        tensor_vector_size_parallel(
+            client
+                .io_optimized_vector_sizes(input_dtype.size())
+                .filter(|&v| v <= quant_type.max_vector_size() as usize),
+            &input.shape,
+            &input.strides,
+            input.shape.len() - 1,
+        )
+    };
+    let working_units = num_elems / vector_size;
     let cube_dim = CubeDim::new(client, working_units);
     let cube_count = calculate_cube_count_elemwise(client, working_units, cube_dim);
 
@@ -337,15 +372,19 @@ fn dequantize_native<R: Runtime>(
             level: QuantLevel::Tensor | QuantLevel::Block(_),
             mode: QuantMode::Symmetric,
             value,
-            store: QuantStore::Native,
+            store: QuantStore::Native | QuantStore::PackedNative(_),
             ..
         } => {
-            let quant_dtype: ElemType = match value {
-                QuantValue::Q8F | QuantValue::Q8S => ElemType::Int(IntKind::I8),
-                QuantValue::E4M3 => ElemType::Float(FloatKind::E4M3),
-                QuantValue::E5M2 => ElemType::Float(FloatKind::E5M2),
-                QuantValue::E2M1 => ElemType::Float(FloatKind::E2M1),
-                other => panic!("Unsupported quantization value {other:?}"),
+            let quant_dtype: StorageType = match (value, &scheme.store) {
+                (QuantValue::Q8F | QuantValue::Q8S, _) => ElemType::Int(IntKind::I8).into(),
+                (QuantValue::E4M3, _) => ElemType::Float(FloatKind::E4M3).into(),
+                (QuantValue::E5M2, _) => ElemType::Float(FloatKind::E5M2).into(),
+                // PackedNative E2M1 → e2m1x2 (packed pair), not bare e2m1
+                (QuantValue::E2M1, QuantStore::PackedNative(_)) => {
+                    StorageType::Packed(ElemType::Float(FloatKind::E2M1), 2)
+                }
+                (QuantValue::E2M1, _) => ElemType::Float(FloatKind::E2M1).into(),
+                (other, _) => panic!("Unsupported quantization value {other:?}"),
             };
 
             let address_type = input
@@ -353,17 +392,21 @@ fn dequantize_native<R: Runtime>(
                 .max(scale.required_address_type(scale_dtype.size()))
                 .max(output.required_address_type(input_dtype.size()));
 
+            // For PackedNative: input vector_size=1 (one packed element),
+            // output vector_size=packing (multiple floats per packed element)
+            let out_vector_size = if packing > 1 { packing } else { vector_size };
+
             unsafe {
                 dequantize_symmetric_native_kernel::launch_unchecked(
                     client,
                     cube_count,
                     cube_dim,
                     address_type,
-                    vector_size,
-                    vector_size,
+                    out_vector_size, // NF: output float vector size
+                    vector_size,     // NQ: input quant vector size
                     linear_view(client, input.clone(), vector_size),
                     scales_view(client, input, scale, 1, &scheme),
-                    linear_view(client, output, vector_size),
+                    linear_view(client, output, out_vector_size),
                     [input_dtype, scale_dtype, quant_dtype.into()],
                 )
             }

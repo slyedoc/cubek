@@ -6,6 +6,7 @@ pub mod interleaved;
 pub mod mma;
 pub mod plane_vec_mat_inner_product;
 pub mod register;
+pub mod scaled_mma;
 
 mod base;
 mod config;
